@@ -1,6 +1,7 @@
 /**
  * Protected route layout
  * Ensures user is authenticated and creates user/user_profile if needed
+ * For chat routes, also verifies onboarding_status = "ready"
  */
 
 import { auth, currentUser } from '@clerk/nextjs/server';
@@ -8,6 +9,7 @@ import { redirect } from 'next/navigation';
 import {
   ensureUserExists,
   ensureUserProfileExists,
+  getUserProfile,
 } from '@/lib/services/user-service';
 
 export default async function ProtectedLayout({
