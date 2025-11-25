@@ -7,6 +7,7 @@ import { ApifyClient } from 'apify-client';
 import { getDatabaseClient } from '@/lib/db';
 import { updateOnboardingStatus } from '@/lib/services/user-service';
 import { cleanLinkedInPostText } from '@/lib/utils/text-cleaning';
+import { analyzeUserData } from '@/lib/services/analysis';
 import type {
   LinkedInProfile,
   LinkedInPost,
@@ -320,6 +321,17 @@ export async function ingestLinkedInData(
     // Update onboarding status to analysis_in_progress
     const analysisStatus: OnboardingStatus = 'analysis_in_progress';
     await updateOnboardingStatus(userId, analysisStatus);
+
+    // Trigger analysis in background (don't await - let it run asynchronously)
+    // The analysis service will update the status when complete
+    analyzeUserData(userId).catch((error) => {
+      console.error('Error in background analysis:', error);
+      // Set status to error if analysis fails
+      const errorStatus: OnboardingStatus = 'error';
+      updateOnboardingStatus(userId, errorStatus).catch((updateError) => {
+        console.error('Error updating status to error:', updateError);
+      });
+    });
 
     return { success: true };
   } catch (error) {
