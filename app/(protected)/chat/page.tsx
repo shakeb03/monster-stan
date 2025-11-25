@@ -136,7 +136,8 @@ export default function ChatPage(): React.ReactElement {
     content: string
   ): Promise<void> => {
     try {
-      const response = await fetch(`/api/chats/${chatId}/messages`, {
+      // First, save the user message
+      const userMessageResponse = await fetch(`/api/chats/${chatId}/messages`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -147,15 +148,40 @@ export default function ChatPage(): React.ReactElement {
         }),
       });
 
-      if (!response.ok) {
+      if (!userMessageResponse.ok) {
         throw new Error('Failed to send message');
       }
 
-      const data = (await response.json()) as { message: ChatMessage };
-      const newMessage = data.message;
+      const userMessageData = (await userMessageResponse.json()) as {
+        message: ChatMessage;
+      };
+      const userMessage = userMessageData.message;
 
-      // Add message to list
-      setMessages((prev) => [...prev, newMessage]);
+      // Add user message to list immediately
+      setMessages((prev) => [...prev, userMessage]);
+
+      // Then, get AI response from orchestrator
+      const orchestratorResponse = await fetch(`/api/chats/${chatId}/respond`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          userMessage: content,
+        }),
+      });
+
+      if (!orchestratorResponse.ok) {
+        throw new Error('Failed to get AI response');
+      }
+
+      const orchestratorData = (await orchestratorResponse.json()) as {
+        message: ChatMessage;
+      };
+      const assistantMessage = orchestratorData.message;
+
+      // Add assistant message to list
+      setMessages((prev) => [...prev, assistantMessage]);
 
       // Refresh chats to update last updated time
       await loadChats();

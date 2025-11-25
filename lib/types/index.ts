@@ -12,4 +12,5 @@ export type { StyleJson, EmojiUsage, ParagraphDensity } from './style-json';
 export type { Chat } from './chat';
 export type { ChatMessage, ChatMessageRole } from './chat-message';
 export type { LongTermMemory, SummaryType } from './long-term-memory';
+export type { Intent, IntentClassification } from './intent';
 
