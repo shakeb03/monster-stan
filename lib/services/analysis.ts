@@ -422,11 +422,41 @@ export async function analyzeUserData(userId: string): Promise<AnalysisResult> {
     );
 
     // Step 5: Store style profile
-    await storeStyleProfile(userId, styleJson, confidence);
+    const storedStyleProfile = await storeStyleProfile(userId, styleJson, confidence);
 
     // Step 6: Set onboarding status to ready
     const readyStatus: OnboardingStatus = 'ready';
     await updateOnboardingStatus(userId, readyStatus);
+
+    // Step 7: Create initial memory entries (persona and goals)
+    try {
+      const { createInitialMemory } = await import('@/lib/ai/memory-summarizer');
+      // Use the stored style profile - validate it's a proper StyleJson
+      let styleProfileForMemory: StyleJson | null = null;
+      if (storedStyleProfile.style_json && typeof storedStyleProfile.style_json === 'object') {
+        const json = storedStyleProfile.style_json as unknown;
+        if (
+          json !== null &&
+          typeof json === 'object' &&
+          'tone' in json &&
+          'formality_level' in json &&
+          'average_length_words' in json &&
+          'emoji_usage' in json &&
+          'structure_patterns' in json &&
+          'hook_patterns' in json &&
+          'hashtag_style' in json &&
+          'favorite_topics' in json &&
+          'common_phrases_or_cadence_examples' in json &&
+          'paragraph_density' in json
+        ) {
+          styleProfileForMemory = json as StyleJson;
+        }
+      }
+      await createInitialMemory(userId, profile, updatedPosts, styleProfileForMemory);
+    } catch (error) {
+      console.error('Error creating initial memory:', error);
+      // Don't fail the analysis if memory creation fails
+    }
 
     return { success: true };
   } catch (error) {

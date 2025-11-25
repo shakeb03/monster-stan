@@ -102,6 +102,16 @@ export async function POST(
       orchestratorOutput.metadata
     );
 
+    // Update memory in background (non-blocking)
+    // This runs asynchronously and won't block the response
+    const { updateMemoryAfterInteraction } = await import(
+      '@/lib/services/memory-updater'
+    );
+    const updatedHistory = [...chatHistory, assistantMessage];
+    updateMemoryAfterInteraction(userId, updatedHistory).catch((error) => {
+      console.error('Error updating memory:', error);
+    });
+
     return NextResponse.json({
       message: assistantMessage,
       intent: orchestratorOutput.intent,
