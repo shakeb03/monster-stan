@@ -5,6 +5,12 @@
 
 import OpenAI from 'openai';
 import { upsertMemory } from '@/lib/services/memory-service';
+import {
+  buildCompletePrompt,
+  buildStyleBlock,
+  buildFactsBlock,
+  buildSafetyRules,
+} from '@/lib/ai/prompt-builder';
 import type {
   SummaryType,
   LinkedInProfile,
@@ -24,51 +30,6 @@ function getOpenAIClient(): OpenAI {
   return new OpenAI({ apiKey });
 }
 
-/**
- * Builds FACTS block for memory summarization
- */
-function buildMemoryFactsBlock(
-  profile: LinkedInProfile | null,
-  posts: LinkedInPost[],
-  chatMessages: ChatMessage[]
-): string {
-  const facts: string[] = [];
-
-  // Add LinkedIn profile
-  if (profile) {
-    facts.push('LINKEDIN PROFILE:');
-    if (profile.headline) facts.push(`Headline: ${profile.headline}`);
-    if (profile.about) facts.push(`About: ${profile.about}`);
-    if (profile.location) facts.push(`Location: ${profile.location}`);
-  }
-
-  // Add recent high-performing posts
-  const highPerformingPosts = posts
-    .filter((p) => p.is_high_performing)
-    .slice(0, 5);
-  if (highPerformingPosts.length > 0) {
-    facts.push('\nHIGH-PERFORMING POSTS:');
-    highPerformingPosts.forEach((post, idx) => {
-      if (post.text) {
-        facts.push(`Post ${idx + 1}: ${post.text}`);
-      }
-    });
-  }
-
-  // Add recent chat messages
-  if (chatMessages.length > 0) {
-    facts.push('\nRECENT CHAT MESSAGES:');
-    chatMessages.slice(-10).forEach((msg) => {
-      facts.push(`${msg.role}: ${msg.content}`);
-    });
-  }
-
-  if (facts.length === 0) {
-    return 'FACTS BLOCK:\nNo data available.';
-  }
-
-  return `FACTS BLOCK:\n${facts.join('\n')}\n\nIMPORTANT: Only use information from FACTS. Never invent biographical facts, roles, achievements, or years.`;
-}
 
 /**
  * Generates persona summary
@@ -82,23 +43,27 @@ export async function generatePersonaSummary(
 ): Promise<void> {
   const client = getOpenAIClient();
 
-  const factsBlock = buildMemoryFactsBlock(profile, posts, chatMessages);
-  const styleBlock = styleProfile
-    ? `STYLE BLOCK:\nTone: ${styleProfile.tone}\nFormality: ${styleProfile.formality_level}/10\n\n`
-    : 'STYLE BLOCK:\nNo style profile available.\n\n';
+  // Use high-performing posts for persona
+  const highPerformingPosts = posts
+    .filter((p) => p.is_high_performing)
+    .slice(0, 5);
 
   const instructionsBlock = `INSTRUCTIONS BLOCK:
 Based on the FACTS provided, create a concise persona summary (2-3 paragraphs) that captures:
-- Professional identity and background
-- Key values and communication style
-- Notable characteristics or patterns
+- Professional identity and background (from LinkedIn profile and posts)
+- Key values and communication style (from posts and chat messages)
+- Notable characteristics or patterns (from writing style and content)
 
-Use only information from FACTS. Do not invent facts. If information is missing, state that clearly.`;
+CRITICAL: Use only information from FACTS. Do not invent facts. If information is missing, state that clearly or create a minimal summary.`;
 
-  const prompt = `${styleBlock}${factsBlock}\n\n${instructionsBlock}\n\nSAFETY RULES:
-1. Never invent biographical facts, roles, achievements, or years.
-2. Base summary only on provided FACTS.
-3. If data is insufficient, create a minimal summary or note limitations.`;
+  const prompt = buildCompletePrompt(
+    styleProfile,
+    highPerformingPosts,
+    profile,
+    [], // memory not needed for initial persona
+    chatMessages,
+    instructionsBlock
+  );
 
   const response = await client.chat.completions.create({
     model: 'gpt-4o',
@@ -132,38 +97,23 @@ export async function generateGoalsSummary(
 ): Promise<void> {
   const client = getOpenAIClient();
 
-  const facts: string[] = [];
-  if (profile?.about) {
-    facts.push(`LinkedIn About: ${profile.about}`);
-  }
-  if (chatMessages.length > 0) {
-    facts.push(
-      '\nChat Messages:\n' +
-        chatMessages
-          .slice(-20)
-          .map((msg) => `${msg.role}: ${msg.content}`)
-          .join('\n')
-    );
-  }
-
-  const factsBlock =
-    facts.length > 0
-      ? `FACTS BLOCK:\n${facts.join('\n')}\n\nIMPORTANT: Only use information from FACTS.`
-      : 'FACTS BLOCK:\nNo data available.';
-
   const instructionsBlock = `INSTRUCTIONS BLOCK:
 Based on the FACTS provided, extract and summarize the user's goals (1-2 paragraphs). Look for:
-- Career objectives
-- Content goals
-- Professional aspirations
-- What they want to achieve on LinkedIn
+- Career objectives (from LinkedIn profile or chat messages)
+- Content goals (from chat messages)
+- Professional aspirations (from profile or messages)
+- What they want to achieve on LinkedIn (from messages)
 
-Use only information from FACTS. If no goals are mentioned, create a minimal summary noting that goals will be clarified through conversation.`;
+CRITICAL: Use only information from FACTS. If no goals are mentioned, create a minimal summary noting that goals will be clarified through conversation. Never invent goals.`;
 
-  const prompt = `${factsBlock}\n\n${instructionsBlock}\n\nSAFETY RULES:
-1. Never invent goals or aspirations.
-2. Base summary only on provided FACTS.
-3. If no goals are mentioned, note that clearly.`;
+  const prompt = buildCompletePrompt(
+    null, // styleProfile not needed for goals
+    [], // posts not needed for goals
+    profile,
+    [], // memory not needed for initial goals
+    chatMessages,
+    instructionsBlock
+  );
 
   const response = await client.chat.completions.create({
     model: 'gpt-4o',
@@ -198,25 +148,10 @@ export async function updateContentStrategy(
 ): Promise<void> {
   const client = getOpenAIClient();
 
-  const facts: string[] = [];
+  // Use high-performing posts for strategy
+  const highPerforming = posts.filter((p) => p.is_high_performing).slice(0, 10);
 
-  // Add high-performing posts
-  const highPerforming = posts.filter((p) => p.is_high_performing);
-  if (highPerforming.length > 0) {
-    facts.push('HIGH-PERFORMING POSTS:');
-    highPerforming.slice(0, 10).forEach((post, idx) => {
-      if (post.text) {
-        facts.push(`${idx + 1}. ${post.text}`);
-      }
-    });
-  }
-
-  // Add style profile topics
-  if (styleProfile?.favorite_topics) {
-    facts.push(`\nFavorite Topics: ${styleProfile.favorite_topics.join(', ')}`);
-  }
-
-  // Add relevant chat messages about strategy
+  // Filter relevant strategy messages
   const strategyMessages = chatMessages.filter(
     (msg) =>
       msg.role === 'user' &&
@@ -224,31 +159,24 @@ export async function updateContentStrategy(
         msg.content.toLowerCase().includes('theme') ||
         msg.content.toLowerCase().includes('topic'))
   );
-  if (strategyMessages.length > 0) {
-    facts.push('\nStrategy Discussions:');
-    strategyMessages.forEach((msg) => {
-      facts.push(`- ${msg.content}`);
-    });
-  }
-
-  const factsBlock =
-    facts.length > 0
-      ? `FACTS BLOCK:\n${facts.join('\n')}\n\nIMPORTANT: Only use information from FACTS.`
-      : 'FACTS BLOCK:\nNo data available.';
 
   const instructionsBlock = `INSTRUCTIONS BLOCK:
 Based on the FACTS provided, create or update a content strategy summary (2-3 paragraphs) that includes:
-- Effective content themes
-- What types of posts perform well
-- Recommended posting approaches
-- Topics that resonate with the audience
+- Effective content themes (from high-performing posts and favorite topics)
+- What types of posts perform well (from engagement data in FACTS)
+- Recommended posting approaches (from style patterns and successful posts)
+- Topics that resonate with the audience (from favorite topics and high-performing content)
 
-Use only information from FACTS. Do not invent strategies.`;
+CRITICAL: Use only information from FACTS. Do not invent strategies. If data is insufficient, note limitations.`;
 
-  const prompt = `${factsBlock}\n\n${instructionsBlock}\n\nSAFETY RULES:
-1. Never invent strategies or themes.
-2. Base strategy only on provided FACTS.
-3. If data is insufficient, note limitations.`;
+  const prompt = buildCompletePrompt(
+    styleProfile,
+    highPerforming,
+    null, // profile not needed for strategy
+    [], // memory not needed (we're updating strategy itself)
+    strategyMessages.length > 0 ? strategyMessages : chatMessages,
+    instructionsBlock
+  );
 
   const response = await client.chat.completions.create({
     model: 'gpt-4o',
@@ -282,25 +210,13 @@ export async function updatePastWins(
 ): Promise<void> {
   const client = getOpenAIClient();
 
-  const facts: string[] = [];
+  // Use high-performing posts as wins
+  const highPerforming = posts
+    .filter((p) => p.is_high_performing)
+    .sort((a, b) => b.engagement_score - a.engagement_score)
+    .slice(0, 10);
 
-  // Add high-performing posts as wins
-  const highPerforming = posts.filter((p) => p.is_high_performing);
-  if (highPerforming.length > 0) {
-    facts.push('HIGH-PERFORMING POSTS (WINS):');
-    highPerforming
-      .sort((a, b) => b.engagement_score - a.engagement_score)
-      .slice(0, 10)
-      .forEach((post, idx) => {
-        if (post.text) {
-          facts.push(
-            `${idx + 1}. ${post.text}\n   Engagement: ${post.engagement_score.toFixed(1)} (${post.likes_count} likes, ${post.comments_count} comments, ${post.shares_count} shares)`
-          );
-        }
-      });
-  }
-
-  // Add mentions of wins in chat
+  // Filter win-related messages
   const winMessages = chatMessages.filter(
     (msg) =>
       msg.role === 'user' &&
@@ -308,30 +224,23 @@ export async function updatePastWins(
         msg.content.toLowerCase().includes('success') ||
         msg.content.toLowerCase().includes('achievement'))
   );
-  if (winMessages.length > 0) {
-    facts.push('\nMentioned Wins:');
-    winMessages.forEach((msg) => {
-      facts.push(`- ${msg.content}`);
-    });
-  }
-
-  const factsBlock =
-    facts.length > 0
-      ? `FACTS BLOCK:\n${facts.join('\n')}\n\nIMPORTANT: Only use information from FACTS.`
-      : 'FACTS BLOCK:\nNo data available.';
 
   const instructionsBlock = `INSTRUCTIONS BLOCK:
 Based on the FACTS provided, create or update a past wins summary (1-2 paragraphs) that highlights:
-- Successful posts and their performance
-- What made them successful
-- Patterns in high-performing content
+- Successful posts and their performance (from high-performing posts with engagement scores)
+- What made them successful (from engagement metrics and content analysis)
+- Patterns in high-performing content (from style and topic analysis)
 
-Use only information from FACTS. Do not invent wins.`;
+CRITICAL: Use only information from FACTS. Do not invent wins. If no wins are available, note that clearly.`;
 
-  const prompt = `${factsBlock}\n\n${instructionsBlock}\n\nSAFETY RULES:
-1. Never invent wins or achievements.
-2. Base summary only on provided FACTS.
-3. If no wins are available, note that clearly.`;
+  const prompt = buildCompletePrompt(
+    null, // styleProfile not needed for wins tracking
+    highPerforming,
+    null, // profile not needed
+    [], // memory not needed
+    winMessages.length > 0 ? winMessages : chatMessages,
+    instructionsBlock
+  );
 
   const response = await client.chat.completions.create({
     model: 'gpt-4o',

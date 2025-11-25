@@ -251,21 +251,30 @@ async function generateStyleProfile(
     confidence = 'MEDIUM';
   }
 
-  // Create prompt for style analysis
-  const postsContext = postTexts
-    .slice(0, 10)
-    .map((text, idx) => `Post ${idx + 1}:\n${text}`)
-    .join('\n\n---\n\n');
+  // Build FACTS block
+  const facts: string[] = [];
+  if (profileAbout) {
+    facts.push(`PROFILE ABOUT SECTION:\n${profileAbout}`);
+  }
+  if (postTexts.length > 0) {
+    facts.push('\nLINKEDIN POSTS:');
+    postTexts.slice(0, 10).forEach((text, idx) => {
+      facts.push(`Post ${idx + 1}:\n${text}`);
+    });
+  }
 
-  const profileContext = profileAbout
-    ? `Profile About Section:\n${profileAbout}\n\n`
-    : '';
+  const factsBlock =
+    facts.length > 0
+      ? `FACTS BLOCK:\n${facts.join('\n\n---\n\n')}\n\nCRITICAL: Only analyze style patterns from the provided posts. Do not invent facts about the user.`
+      : 'FACTS BLOCK:\nNo posts available for style analysis.';
 
-  const prompt = `Analyze the writing style from the following LinkedIn posts and profile information.
+  // STYLE block not applicable for style extraction (we're extracting style, not applying it)
+  const styleBlock = 'STYLE BLOCK:\nNot applicable - this is style extraction, not style application.';
 
-${profileContext}${postsContext}
+  const instructionsBlock = `INSTRUCTIONS BLOCK:
+Analyze the writing style from the FACTS provided (LinkedIn posts and profile about section).
 
-Based on these posts, extract and return a JSON object with the following exact structure:
+Extract and return a JSON object with the following exact structure:
 {
   "tone": "string describing the overall tone (e.g., 'professional', 'conversational', 'inspirational')",
   "formality_level": number from 1-10 where 1 is very casual and 10 is very formal,
@@ -279,7 +288,17 @@ Based on these posts, extract and return a JSON object with the following exact 
   "paragraph_density": one of "compact", "spaced", or "varied"
 }
 
+CRITICAL: Only extract style patterns from the provided FACTS. Do not invent style characteristics. If data is insufficient, use conservative defaults.
+
 Return ONLY valid JSON, no additional text.`;
+
+  const safetyRules = `SAFETY RULES:
+1. Only extract style patterns that are clearly present in the FACTS.
+2. Do not infer style characteristics not supported by the provided posts.
+3. If data is insufficient, use conservative defaults (e.g., "professional" tone, formality_level 5).
+4. Do not invent style patterns.`;
+
+  const prompt = `${styleBlock}\n\n${factsBlock}\n\n${instructionsBlock}\n\n${safetyRules}`;
 
   const response = await client.chat.completions.create({
     model: 'gpt-4o',

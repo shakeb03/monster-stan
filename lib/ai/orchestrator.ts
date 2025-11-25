@@ -7,6 +7,13 @@ import OpenAI from 'openai';
 import { retrieveRelevantPosts } from '@/lib/ai/rag';
 import { getUserMemory } from '@/lib/services/memory-service';
 import { queryDatabase } from '@/lib/db';
+import {
+  buildCompletePrompt,
+  buildStyleBlock,
+  buildFactsBlock,
+  buildSafetyRules,
+  validateAgainstFacts,
+} from '@/lib/ai/prompt-builder';
 import type {
   IntentClassification,
   Intent,
@@ -44,6 +51,7 @@ function getOpenAIClient(): OpenAI {
 
 /**
  * Classifies user message intent
+ * Uses STYLE/FACTS/INSTRUCTIONS pattern
  */
 async function classifyIntent(
   userMessage: string,
@@ -51,15 +59,19 @@ async function classifyIntent(
 ): Promise<IntentClassification> {
   const client = getOpenAIClient();
 
-  const historyContext = chatHistory
-    .slice(-5) // Last 5 messages for context
-    .map((msg) => `${msg.role}: ${msg.content}`)
-    .join('\n');
+  // Build FACTS block from chat history
+  const factsBlock = chatHistory.length > 0
+    ? `FACTS BLOCK:\nRECENT CHAT HISTORY:\n${chatHistory
+        .slice(-5)
+        .map((msg) => `${msg.role}: ${msg.content}`)
+        .join('\n')}\n\nCRITICAL: Only use information from FACTS.`
+    : 'FACTS BLOCK:\nNo previous chat history available.';
 
-  const prompt = `Classify the user's message into one of these intents: "WRITE_POST", "ANALYZE_PROFILE", "STRATEGY", or "OTHER".
+  // STYLE block not needed for classification, but we include it for consistency
+  const styleBlock = 'STYLE BLOCK:\nNot applicable for intent classification.';
 
-Recent chat history:
-${historyContext || 'No previous messages'}
+  const instructionsBlock = `INSTRUCTIONS BLOCK:
+Classify the user's message into one of these intents: "WRITE_POST", "ANALYZE_PROFILE", "STRATEGY", or "OTHER".
 
 User message: ${userMessage}
 
@@ -72,17 +84,28 @@ Return a JSON object with this exact structure:
   "proposed_follow_ups": string[]
 }
 
-For WRITE_POST intent:
-- Set requires_rag to true if the message mentions career, experience, achievements, or personal journey
-- Set needs_clarification to true if topic, angle, or key points are missing
-- missing_fields should list what's needed (e.g., ["topic", "target_audience"])
-- proposed_follow_ups should be 1-3 clarifying questions
+Classification rules:
+- WRITE_POST: User wants to create a LinkedIn post
+  - Set requires_rag to true if message mentions career, experience, achievements, or personal journey
+  - Set needs_clarification to true if topic, angle, or key points are missing
+  - missing_fields should list what's needed (e.g., ["topic", "target_audience"])
+  - proposed_follow_ups should be 1-3 clarifying questions
 
-For ANALYZE_PROFILE or STRATEGY:
-- Set requires_rag to true
-- needs_clarification should typically be false
+- ANALYZE_PROFILE: User wants analysis of their LinkedIn profile
+  - Set requires_rag to true
+  - needs_clarification should typically be false
+
+- STRATEGY: User wants content strategy recommendations
+  - Set requires_rag to true
+  - needs_clarification should typically be false
+
+- OTHER: Any other request
+  - Set requires_rag based on whether the request needs LinkedIn data
+  - needs_clarification based on whether more info is needed
 
 Return ONLY valid JSON, no additional text.`;
+
+  const prompt = `${styleBlock}\n\n${factsBlock}\n\n${instructionsBlock}\n\n${buildSafetyRules()}`;
 
   const response = await client.chat.completions.create({
     model: 'gpt-4o',
@@ -126,79 +149,6 @@ Return ONLY valid JSON, no additional text.`;
   }
 }
 
-/**
- * Builds STYLE block from style profile
- */
-function buildStyleBlock(styleProfile: StyleJson | null): string {
-  if (!styleProfile) {
-    return 'STYLE BLOCK:\nNo style profile available. Use a professional, clear writing style.';
-  }
-
-  return `STYLE BLOCK:
-Tone: ${styleProfile.tone}
-Formality Level: ${styleProfile.formality_level}/10
-Average Length: ${styleProfile.average_length_words} words
-Emoji Usage: ${styleProfile.emoji_usage}
-Structure Patterns: ${styleProfile.structure_patterns.join(', ')}
-Hook Patterns: ${styleProfile.hook_patterns.join(', ')}
-Hashtag Style: ${styleProfile.hashtag_style}
-Favorite Topics: ${styleProfile.favorite_topics.join(', ')}
-Common Phrases/Cadence Examples:
-${styleProfile.common_phrases_or_cadence_examples.map((p) => `- ${p}`).join('\n')}
-Paragraph Density: ${styleProfile.paragraph_density}
-
-IMPORTANT: STYLE only controls HOW to write (voice, tone, structure), NOT WHAT to write (content, facts).`;
-}
-
-/**
- * Builds FACTS block from RAG posts, profile, and memory
- */
-function buildFactsBlock(
-  ragPosts: LinkedInPost[],
-  profile: LinkedInProfile | null,
-  memory: LongTermMemory[]
-): string {
-  const facts: string[] = [];
-
-  // Add RAG posts
-  if (ragPosts.length > 0) {
-    facts.push('RELEVANT POSTS FROM USER\'S LINKEDIN:');
-    ragPosts.forEach((post, idx) => {
-      if (post.text) {
-        facts.push(`Post ${idx + 1}: ${post.text}`);
-        if (post.posted_at) {
-          facts.push(`Posted: ${new Date(post.posted_at).toLocaleDateString()}`);
-        }
-      }
-    });
-  }
-
-  // Add LinkedIn profile
-  if (profile) {
-    facts.push('\nLINKEDIN PROFILE:');
-    if (profile.headline) facts.push(`Headline: ${profile.headline}`);
-    if (profile.about) facts.push(`About: ${profile.about}`);
-    if (profile.location) facts.push(`Location: ${profile.location}`);
-  }
-
-  // Add memory
-  if (memory.length > 0) {
-    facts.push('\nLONG-TERM MEMORY:');
-    memory.forEach((mem) => {
-      const content =
-        typeof mem.content === 'string'
-          ? mem.content
-          : JSON.stringify(mem.content);
-      facts.push(`${mem.summary_type}: ${content}`);
-    });
-  }
-
-  if (facts.length === 0) {
-    return 'FACTS BLOCK:\nNo verified data available.';
-  }
-
-  return `FACTS BLOCK:\n${facts.join('\n')}\n\nIMPORTANT: Only use information from FACTS. Never invent biographical facts, roles, achievements, or years. If data is missing, ask the user or produce generic statements.`;
-}
 
 /**
  * Generates response for WRITE_POST intent
@@ -209,13 +159,17 @@ async function generateWritePostResponse(
   ragPosts: LinkedInPost[],
   profile: LinkedInProfile | null,
   memory: LongTermMemory[],
-  userMessage: string
+  userMessage: string,
+  chatHistory: ChatMessage[]
 ): Promise<string> {
   const client = getOpenAIClient();
 
   if (classification.needs_clarification) {
-    // Generate clarifying question
-    const clarificationPrompt = `The user wants to write a LinkedIn post but needs clarification.
+    // Generate clarifying question using STYLE/FACTS/INSTRUCTIONS
+    const factsBlock = buildFactsBlock(ragPosts, profile, memory, chatHistory);
+    const styleBlock = buildStyleBlock(styleProfile);
+    const instructionsBlock = `INSTRUCTIONS BLOCK:
+The user wants to write a LinkedIn post but needs clarification.
 
 User request: ${userMessage}
 Missing fields: ${classification.missing_fields.join(', ')}
@@ -223,17 +177,19 @@ Proposed follow-ups: ${classification.proposed_follow_ups.join(', ')}
 
 Generate a concise, friendly clarifying question (1-2 sentences max) asking for the missing information.`;
 
+    const prompt = `${styleBlock}\n\n${factsBlock}\n\n${instructionsBlock}\n\n${buildSafetyRules()}`;
+
     const response = await client.chat.completions.create({
       model: 'gpt-4o',
       messages: [
         {
           role: 'system',
           content:
-            'You are a helpful assistant that asks clarifying questions. Be concise and friendly.',
+            'You are a helpful assistant that asks clarifying questions. Be concise and friendly. Never invent facts.',
         },
         {
           role: 'user',
-          content: clarificationPrompt,
+          content: prompt,
         },
       ],
       temperature: 0.7,
@@ -242,9 +198,7 @@ Generate a concise, friendly clarifying question (1-2 sentences max) asking for 
     return response.choices[0]?.message?.content || 'Could you provide more details about what you\'d like to write about?';
   }
 
-  // Generate post draft
-  const styleBlock = buildStyleBlock(styleProfile);
-  const factsBlock = buildFactsBlock(ragPosts, profile, memory);
+  // Generate post draft using STYLE/FACTS/INSTRUCTIONS
   const instructionsBlock = `INSTRUCTIONS BLOCK:
 User wants to write a LinkedIn post.
 User request: ${userMessage}
@@ -258,12 +212,14 @@ Use the STYLE block to match the user's writing voice.
 Use only information from the FACTS block - never invent facts.
 If information is missing, ask the user or use generic statements.`;
 
-  const fullPrompt = `${styleBlock}\n\n${factsBlock}\n\n${instructionsBlock}\n\nSAFETY RULES:
-1. Never invent biographical facts, roles, achievements, or years.
-2. If data is missing, ask a question or use generic statements.
-3. STYLE only controls voice, not content.
-4. FACTS override STYLE.
-5. Do not infer identity details from tone.`;
+  const prompt = buildCompletePrompt(
+    styleProfile,
+    ragPosts,
+    profile,
+    memory,
+    chatHistory, // Include chat history for context
+    instructionsBlock
+  );
 
   const response = await client.chat.completions.create({
     model: 'gpt-4o',
@@ -275,13 +231,66 @@ If information is missing, ask the user or use generic statements.`;
       },
       {
         role: 'user',
-        content: fullPrompt,
+        content: prompt,
       },
     ],
     temperature: 0.7,
   });
 
-  return response.choices[0]?.message?.content || 'I apologize, but I couldn\'t generate a response. Please try again.';
+  let generatedText = response.choices[0]?.message?.content || 'I apologize, but I couldn\'t generate a response. Please try again.';
+
+  // Two-pass validation for sensitive content (career posts, bios, about sections)
+  // Check if the post mentions career, experience, achievements, or personal journey
+  const isSensitiveContent =
+    userMessage.toLowerCase().includes('career') ||
+    userMessage.toLowerCase().includes('experience') ||
+    userMessage.toLowerCase().includes('achievement') ||
+    userMessage.toLowerCase().includes('bio') ||
+    userMessage.toLowerCase().includes('about') ||
+    userMessage.toLowerCase().includes('journey') ||
+    generatedText.toLowerCase().includes('worked') ||
+    generatedText.toLowerCase().includes('years of') ||
+    generatedText.toLowerCase().includes('achieved');
+
+  if (isSensitiveContent) {
+    const factsBlockForValidation = buildFactsBlock(ragPosts, profile, memory, chatHistory);
+    const validation = await validateAgainstFacts(generatedText, factsBlockForValidation);
+    if (!validation.isValid && validation.unsupportedClaims.length > 0) {
+      // Refactor the prompt to remove unsupported claims
+      const refactorPrompt = `${buildStyleBlock(styleProfile)}\n\n${factsBlockForValidation}\n\nINSTRUCTIONS BLOCK:
+The previous draft contained unsupported claims: ${validation.unsupportedClaims.join(', ')}
+
+Regenerate the LinkedIn post draft, ensuring:
+1. Remove or rewrite any claims not supported by FACTS
+2. Keep the same structure (Hook/Body/CTA)
+3. Match the user's style
+4. Only use verified information from FACTS
+
+User request: ${userMessage}
+
+${buildSafetyRules()}`;
+
+      const refactoredResponse = await client.chat.completions.create({
+        model: 'gpt-4o',
+        messages: [
+          {
+            role: 'system',
+            content:
+              'You are a LinkedIn content assistant. Remove any unsupported claims and regenerate using only verified facts.',
+          },
+          {
+            role: 'user',
+            content: refactorPrompt,
+          },
+        ],
+        temperature: 0.7,
+      });
+
+      generatedText = refactoredResponse.choices[0]?.message?.content || generatedText;
+    }
+  }
+
+  return generatedText;
 }
 
 /**
@@ -294,7 +303,6 @@ async function generateAnalyzeProfileResponse(
 ): Promise<string> {
   const client = getOpenAIClient();
 
-  const factsBlock = buildFactsBlock(ragPosts, profile, []);
   const instructionsBlock = `INSTRUCTIONS BLOCK:
 Analyze the user's LinkedIn profile and posts.
 
@@ -303,12 +311,16 @@ Based ONLY on the FACTS provided, produce:
 2. Weaknesses - Areas for improvement
 3. What to improve - Specific actionable recommendations
 
-IMPORTANT: Only use information from FACTS. Never invent facts. If information is missing, state that clearly.`;
+CRITICAL: Only use information from FACTS. Never invent facts. If information is missing, state that clearly.`;
 
-  const fullPrompt = `${factsBlock}\n\n${instructionsBlock}\n\nSAFETY RULES:
-1. Never invent biographical facts, roles, achievements, or years.
-2. Base analysis only on provided FACTS.
-3. If data is insufficient, state limitations clearly.`;
+  const prompt = buildCompletePrompt(
+    styleProfile,
+    ragPosts,
+    profile,
+    [], // memory not needed for profile analysis
+    [], // chatHistory not needed for profile analysis
+    instructionsBlock
+  );
 
   const response = await client.chat.completions.create({
     model: 'gpt-4o',
@@ -320,13 +332,50 @@ IMPORTANT: Only use information from FACTS. Never invent facts. If information i
       },
       {
         role: 'user',
-        content: fullPrompt,
+        content: prompt,
       },
     ],
     temperature: 0.5,
   });
 
-  return response.choices[0]?.message?.content || 'I apologize, but I couldn\'t analyze your profile. Please try again.';
+  let generatedText = response.choices[0]?.message?.content || 'I apologize, but I couldn\'t analyze your profile. Please try again.';
+
+  // Two-pass validation for profile analysis (sensitive - involves biographical analysis)
+  const factsBlockForValidation = buildFactsBlock(ragPosts, profile, [], []);
+  const validation = await validateAgainstFacts(generatedText, factsBlockForValidation);
+  
+  if (!validation.isValid && validation.unsupportedClaims.length > 0) {
+    // Refactor to remove unsupported claims
+    const refactorPrompt = `${buildStyleBlock(styleProfile)}\n\n${factsBlockForValidation}\n\nINSTRUCTIONS BLOCK:
+The previous analysis contained unsupported claims: ${validation.unsupportedClaims.join(', ')}
+
+Regenerate the profile analysis, ensuring:
+1. Remove or rewrite any claims not supported by FACTS
+2. Keep the same structure (Strengths/Weaknesses/What to improve)
+3. Only use verified information from FACTS
+
+${buildSafetyRules()}`;
+
+    const refactoredResponse = await client.chat.completions.create({
+      model: 'gpt-4o',
+      messages: [
+        {
+          role: 'system',
+          content:
+            'You are a LinkedIn profile analyst. Remove any unsupported claims and regenerate using only verified facts.',
+        },
+        {
+          role: 'user',
+          content: refactorPrompt,
+        },
+      ],
+      temperature: 0.5,
+    });
+
+    generatedText = refactoredResponse.choices[0]?.message?.content || generatedText;
+  }
+
+  return generatedText;
 }
 
 /**
@@ -339,31 +388,31 @@ async function generateStrategyResponse(
 ): Promise<string> {
   const client = getOpenAIClient();
 
-  const factsBlock = buildFactsBlock(ragPosts, null, memory);
-  const styleBlock = buildStyleBlock(styleProfile);
-
   const favoriteTopics =
     styleProfile?.favorite_topics.join(', ') || 'general professional topics';
-  const highPerformingPosts = ragPosts.filter((p) => p.is_high_performing);
 
   const instructionsBlock = `INSTRUCTIONS BLOCK:
 Generate a content strategy for the user.
 
-Use:
+Use information from FACTS:
 - Favorite topics: ${favoriteTopics}
-- High-performing posts (if available)
-- User goals from memory
+- High-performing posts (if available in FACTS)
+- User goals from memory (if available in FACTS)
 
 Generate:
 1. Themes - 3-5 content themes
 2. Post ideas - 3-5 post ideas per theme
 
-IMPORTANT: Only use information from FACTS. Never invent facts.`;
+CRITICAL: Only use information from FACTS. Never invent facts. If data is insufficient, state limitations clearly.`;
 
-  const fullPrompt = `${styleBlock}\n\n${factsBlock}\n\n${instructionsBlock}\n\nSAFETY RULES:
-1. Never invent biographical facts, roles, achievements, or years.
-2. Base strategy only on provided FACTS.
-3. If data is insufficient, state limitations clearly.`;
+  const prompt = buildCompletePrompt(
+    styleProfile,
+    ragPosts,
+    null, // profile not needed for strategy
+    memory,
+    [], // chatHistory not needed for strategy
+    instructionsBlock
+  );
 
   const response = await client.chat.completions.create({
     model: 'gpt-4o',
@@ -375,7 +424,7 @@ IMPORTANT: Only use information from FACTS. Never invent facts.`;
       },
       {
         role: 'user',
-        content: fullPrompt,
+        content: prompt,
       },
     ],
     temperature: 0.7,
@@ -389,20 +438,25 @@ IMPORTANT: Only use information from FACTS. Never invent facts.`;
  */
 async function generateOtherResponse(
   userMessage: string,
-  styleProfile: StyleJson | null
+  styleProfile: StyleJson | null,
+  memory: LongTermMemory[]
 ): Promise<string> {
   const client = getOpenAIClient();
 
-  const styleBlock = buildStyleBlock(styleProfile);
   const instructionsBlock = `INSTRUCTIONS BLOCK:
 User message: ${userMessage}
 
-Provide a helpful response. If you need more information, ask clarifying questions.`;
+Provide a helpful response. If you need more information, ask clarifying questions.
+Use information from FACTS if relevant, but never invent facts.`;
 
-  const fullPrompt = `${styleBlock}\n\n${instructionsBlock}\n\nSAFETY RULES:
-1. Never invent biographical facts, roles, achievements, or years.
-2. If you don't know something, ask the user.
-3. Be helpful and professional.`;
+  const prompt = buildCompletePrompt(
+    styleProfile,
+    [], // ragPosts not needed for general responses
+    null, // profile not needed
+    memory,
+    [], // chatHistory not needed for general responses
+    instructionsBlock
+  );
 
   const response = await client.chat.completions.create({
     model: 'gpt-4o',
@@ -414,7 +468,7 @@ Provide a helpful response. If you need more information, ask clarifying questio
       },
       {
         role: 'user',
-        content: fullPrompt,
+        content: prompt,
       },
     ],
     temperature: 0.7,
@@ -463,7 +517,8 @@ export async function orchestrateResponse(
         ragPosts,
         profile,
         memory,
-        userMessage
+        userMessage,
+        chatHistory
       );
       break;
     case 'ANALYZE_PROFILE':
@@ -478,7 +533,7 @@ export async function orchestrateResponse(
       break;
     case 'OTHER':
     default:
-      response = await generateOtherResponse(userMessage, styleProfile);
+      response = await generateOtherResponse(userMessage, styleProfile, memory);
       break;
   }
 
