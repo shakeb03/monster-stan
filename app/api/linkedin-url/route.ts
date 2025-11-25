@@ -1,6 +1,7 @@
 /**
  * API endpoint for submitting LinkedIn URL
- * Updates user_profile with the LinkedIn URL and sets status to scraping_in_progress
+ * Updates user_profile with the LinkedIn URL, sets status to scraping_in_progress,
+ * and triggers background ingestion
  */
 
 import { auth } from '@clerk/nextjs/server';
@@ -10,6 +11,7 @@ import {
   updateLinkedInUrl,
   updateOnboardingStatus,
 } from '@/lib/services/user-service';
+import { ingestLinkedInData } from '@/lib/services/linkedin-ingestion';
 import type { OnboardingStatus } from '@/lib/types';
 
 export async function POST(request: Request): Promise<NextResponse> {
@@ -51,6 +53,13 @@ export async function POST(request: Request): Promise<NextResponse> {
     // Set status to scraping_in_progress
     const scrapingStatus: OnboardingStatus = 'scraping_in_progress';
     await updateOnboardingStatus(userId, scrapingStatus);
+
+    // Trigger ingestion in background (don't await - let it run asynchronously)
+    // The ingestion service will update the status when complete
+    ingestLinkedInData(userId, linkedinUrl).catch((error) => {
+      console.error('Error in background ingestion:', error);
+      // Error handling is done inside ingestLinkedInData
+    });
 
     return NextResponse.json({
       success: true,
