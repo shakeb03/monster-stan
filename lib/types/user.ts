@@ -1,10 +1,9 @@
 /**
- * User type placeholder
- * This will be defined based on the database schema
+ * User type matching the users table schema from DOC 02
  */
 
 export type User = {
-  id: string;
-  // Additional fields will be added based on database schema
+  id: string; // PK, matches Clerk ID
+  email: string;
+  created_at: string; // timestamp
 };
-

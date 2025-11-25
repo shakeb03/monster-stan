@@ -1,11 +1,12 @@
 /**
- * Chat type placeholder
- * This will be defined based on the database schema
+ * Chat type matching the chats table schema from DOC 02
  */
 
 export type Chat = {
-  id: string;
-  userId: string;
-  // Additional fields will be added based on database schema
+  id: string; // PK
+  user_id: string; // FK → users.id
+  title: string | null;
+  created_at: string; // timestamp
+  updated_at: string; // timestamp
+  is_active: boolean;
 };
-
