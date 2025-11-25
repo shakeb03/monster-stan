@@ -11,6 +11,7 @@ import {
   buildFactsBlock,
   buildSafetyRules,
 } from '@/lib/ai/prompt-builder';
+import { getEnv } from '@/lib/config/env';
 import type {
   SummaryType,
   LinkedInProfile,
@@ -23,11 +24,8 @@ import type {
  * Gets OpenAI client
  */
 function getOpenAIClient(): OpenAI {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    throw new Error('OPENAI_API_KEY environment variable is required');
-  }
-  return new OpenAI({ apiKey });
+  const env = getEnv();
+  return new OpenAI({ apiKey: env.openaiApiKey });
 }
 
 

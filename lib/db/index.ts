@@ -2,11 +2,7 @@
  * Database module exports
  */
 
-export {
-  getDatabasePool,
-  getDatabaseClient,
-  queryDatabase,
-} from './client';
+export { getSupabaseAdminClient } from './client';
 
-export type { Pool, PoolClient } from 'pg';
+export type { SupabaseClient } from '@supabase/supabase-js';
 

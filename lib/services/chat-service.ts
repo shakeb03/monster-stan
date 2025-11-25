@@ -3,19 +3,27 @@
  * Business logic for chat operations
  */
 
-import { getDatabaseClient, queryDatabase } from '@/lib/db';
+import { getSupabaseAdminClient } from '@/lib/db';
 import type { Chat, ChatMessage, ChatMessageRole } from '@/lib/types';
 
 /**
  * Gets all active chats for a user
  */
 export async function getUserChats(userId: string): Promise<Chat[]> {
-  return queryDatabase<Chat>(
-    `SELECT * FROM chats 
-     WHERE user_id = $1 AND is_active = true 
-     ORDER BY updated_at DESC`,
-    [userId]
-  );
+  const supabase = getSupabaseAdminClient();
+
+  const { data, error } = await supabase
+    .from('chats')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('is_active', true)
+    .order('updated_at', { ascending: false });
+
+  if (error) {
+    throw new Error(`Error fetching user chats: ${error.message}`);
+  }
+
+  return (data as Chat[]) || [];
 }
 
 /**
@@ -25,46 +33,73 @@ export async function getChatById(
   chatId: string,
   userId: string
 ): Promise<Chat | null> {
-  const chats = await queryDatabase<Chat>(
-    'SELECT * FROM chats WHERE id = $1 AND user_id = $2 AND is_active = true',
-    [chatId, userId]
-  );
-  return chats.length > 0 ? chats[0] : null;
+  const supabase = getSupabaseAdminClient();
+
+  const { data, error } = await supabase
+    .from('chats')
+    .select('*')
+    .eq('id', chatId)
+    .eq('user_id', userId)
+    .eq('is_active', true)
+    .single();
+
+  if (error) {
+    if (error.code === 'PGRST116') {
+      return null;
+    }
+    throw new Error(`Error fetching chat: ${error.message}`);
+  }
+
+  return data as Chat | null;
 }
 
 /**
  * Creates a new chat
  */
 export async function createChat(userId: string, title?: string): Promise<Chat> {
-  const client = await getDatabaseClient();
-  try {
-    const result = await client.query<Chat>(
-      `INSERT INTO chats (user_id, title, created_at, updated_at, is_active)
-       VALUES ($1, $2, NOW(), NOW(), true)
-       RETURNING *`,
-      [userId, title || null]
-    );
+  const supabase = getSupabaseAdminClient();
+  const now = new Date().toISOString();
 
-    if (result.rows.length === 0) {
-      throw new Error('Failed to create chat');
-    }
+  const { data, error } = await supabase
+    .from('chats')
+    .insert({
+      user_id: userId,
+      title: title || null,
+      created_at: now,
+      updated_at: now,
+      is_active: true,
+    })
+    .select()
+    .single();
 
-    return result.rows[0];
-  } finally {
-    client.release();
+  if (error) {
+    throw new Error(`Error creating chat: ${error.message}`);
   }
+
+  if (!data) {
+    throw new Error('Failed to create chat');
+  }
+
+  return data as Chat;
 }
 
 /**
  * Gets all messages for a chat
  */
 export async function getChatMessages(chatId: string): Promise<ChatMessage[]> {
-  return queryDatabase<ChatMessage>(
-    `SELECT * FROM chat_messages 
-     WHERE chat_id = $1 
-     ORDER BY created_at ASC`,
-    [chatId]
-  );
+  const supabase = getSupabaseAdminClient();
+
+  const { data, error } = await supabase
+    .from('chat_messages')
+    .select('*')
+    .eq('chat_id', chatId)
+    .order('created_at', { ascending: true });
+
+  if (error) {
+    throw new Error(`Error fetching chat messages: ${error.message}`);
+  }
+
+  return (data as ChatMessage[]) || [];
 }
 
 /**
@@ -77,30 +112,38 @@ export async function createChatMessage(
   content: string,
   metadata?: Record<string, unknown>
 ): Promise<ChatMessage> {
-  const client = await getDatabaseClient();
-  try {
-    // Create the message
-    const messageResult = await client.query<ChatMessage>(
-      `INSERT INTO chat_messages (chat_id, user_id, role, content, metadata_json, created_at)
-       VALUES ($1, $2, $3, $4, $5, NOW())
-       RETURNING *`,
-      [chatId, userId, role, content, metadata ? JSON.stringify(metadata) : null]
-    );
+  const supabase = getSupabaseAdminClient();
+  const now = new Date().toISOString();
 
-    if (messageResult.rows.length === 0) {
-      throw new Error('Failed to create chat message');
-    }
+  // Create the message
+  const { data: messageData, error: messageError } = await supabase
+    .from('chat_messages')
+    .insert({
+      chat_id: chatId,
+      user_id: userId,
+      role,
+      content,
+      metadata_json: metadata || null,
+      created_at: now,
+    })
+    .select()
+    .single();
 
-    // Update chat's updated_at timestamp
-    await client.query(
-      'UPDATE chats SET updated_at = NOW() WHERE id = $1',
-      [chatId]
-    );
-
-    return messageResult.rows[0];
-  } finally {
-    client.release();
+  if (messageError) {
+    throw new Error(`Error creating chat message: ${messageError.message}`);
   }
+
+  if (!messageData) {
+    throw new Error('Failed to create chat message');
+  }
+
+  // Update chat's updated_at timestamp
+  await supabase
+    .from('chats')
+    .update({ updated_at: now })
+    .eq('id', chatId);
+
+  return messageData as ChatMessage;
 }
 
 /**
@@ -111,23 +154,27 @@ export async function updateChatTitle(
   userId: string,
   title: string
 ): Promise<Chat> {
-  const client = await getDatabaseClient();
-  try {
-    const result = await client.query<Chat>(
-      `UPDATE chats 
-       SET title = $1, updated_at = NOW()
-       WHERE id = $2 AND user_id = $3
-       RETURNING *`,
-      [title, chatId, userId]
-    );
+  const supabase = getSupabaseAdminClient();
 
-    if (result.rows.length === 0) {
-      throw new Error('Chat not found or access denied');
-    }
+  const { data, error } = await supabase
+    .from('chats')
+    .update({
+      title,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', chatId)
+    .eq('user_id', userId)
+    .select()
+    .single();
 
-    return result.rows[0];
-  } finally {
-    client.release();
+  if (error) {
+    throw new Error(`Error updating chat title: ${error.message}`);
   }
+
+  if (!data) {
+    throw new Error('Chat not found or access denied');
+  }
+
+  return data as Chat;
 }
 

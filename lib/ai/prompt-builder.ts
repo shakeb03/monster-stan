@@ -161,16 +161,15 @@ export function buildCompletePrompt(
 /**
  * Validates generated text against FACTS to detect hallucinations
  */
+import { getEnv } from '@/lib/config/env';
+
 export async function validateAgainstFacts(
   generatedText: string,
   factsBlock: string
 ): Promise<{ isValid: boolean; unsupportedClaims: string[] }> {
   const OpenAI = (await import('openai')).default;
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    throw new Error('OPENAI_API_KEY environment variable is required');
-  }
-  const client = new OpenAI({ apiKey });
+  const env = getEnv();
+  const client = new OpenAI({ apiKey: env.openaiApiKey });
 
   // Build validation prompt using STYLE/FACTS/INSTRUCTIONS structure
   const styleBlock = 'STYLE BLOCK:\nNot applicable for fact validation.';

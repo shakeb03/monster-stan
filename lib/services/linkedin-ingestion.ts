@@ -1,13 +1,13 @@
 /**
  * LinkedIn ingestion service
- * Handles Apify actor execution, data parsing, and storage
+ * Handles Apify actor execution via direct HTTP calls, data parsing, and storage
  */
 
-import { ApifyClient } from 'apify-client';
-import { getDatabaseClient } from '@/lib/db';
+import { getSupabaseAdminClient } from '@/lib/db';
 import { updateOnboardingStatus } from '@/lib/services/user-service';
 import { cleanLinkedInPostText } from '@/lib/utils/text-cleaning';
 import { analyzeUserData } from '@/lib/services/analysis';
+import { getEnv } from '@/lib/config/env';
 import type {
   LinkedInProfile,
   LinkedInPost,
@@ -15,9 +15,11 @@ import type {
 } from '@/lib/types';
 import type {
   ApifyRun,
-  ApifyDatasetItem,
-  ApifyProfileOutput,
-  ApifyPostOutput,
+  ApifyRunStatus,
+  ApifyLinkedinProfileResponse,
+  ApifyLinkedinProfile,
+  ApifyLinkedinPostsResponse,
+  ApifyLinkedinPost,
 } from '@/lib/types/apify';
 
 interface IngestionResult {
@@ -26,61 +28,94 @@ interface IngestionResult {
 }
 
 /**
- * Gets Apify client instance
+ * Triggers the profile actor via HTTP POST
  */
-function getApifyClient(): ApifyClient {
-  const token = process.env.APIFY_TOKEN;
-  if (!token) {
-    throw new Error('APIFY_TOKEN environment variable is required');
+async function triggerProfileActor(
+  linkedinUrl: string
+): Promise<{ id: string }> {
+  const env = getEnv();
+  const url = `https://api.apify.com/v2/acts/apimaestro~linkedin-profile-detail/runs?token=${encodeURIComponent(env.apifyApiToken)}`;
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      includeEmail: false,
+      username: linkedinUrl,
+    }),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Failed to trigger profile actor: ${response.status} ${errorText}`);
   }
-  return new ApifyClient({ token });
+
+  const runData = (await response.json()) as ApifyRun;
+  return { id: runData.data.id };
 }
 
 /**
- * Triggers an Apify actor run
+ * Triggers the posts actor via HTTP POST
  */
-async function triggerActor(
-  actorId: string,
+async function triggerPostsActor(
   linkedinUrl: string
-): Promise<{ id: string; status: string }> {
-  const client = getApifyClient();
-  const run = await client.actor(actorId).start({
-    startUrls: [{ url: linkedinUrl }],
+): Promise<{ id: string }> {
+  const env = getEnv();
+  const url = `https://api.apify.com/v2/acts/supreme_coder~linkedin-post/runs?token=${encodeURIComponent(env.apifyApiToken)}`;
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      deepScrape: true,
+      limitPerSource: 10,
+      rawData: false,
+      urls: [linkedinUrl],
+    }),
   });
-  // Return minimal info needed to track the run
-  return {
-    id: run.id,
-    status: run.status,
-  };
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Failed to trigger posts actor: ${response.status} ${errorText}`);
+  }
+
+  const runData = (await response.json()) as ApifyRun;
+  return { id: runData.data.id };
 }
 
 /**
  * Waits for an Apify run to complete by polling
  */
 async function waitForRunCompletion(
-  actorId: string,
   runId: string,
   maxWaitTime: number = 300000 // 5 minutes default
-): Promise<{ id: string; defaultDatasetId: string | null }> {
-  const client = getApifyClient();
+): Promise<{ defaultDatasetId: string | null }> {
+  const env = getEnv();
   const startTime = Date.now();
 
   while (true) {
-    const run = await client.run(runId).get();
+    const url = `https://api.apify.com/v2/actor-runs/${runId}?token=${encodeURIComponent(env.apifyApiToken)}`;
+    const response = await fetch(url);
 
-    if (!run) {
-      throw new Error(`Apify run ${runId} not found`);
+    if (!response.ok) {
+      throw new Error(`Failed to get run status: ${response.status}`);
     }
 
-    if (run.status === 'SUCCEEDED') {
+    const runData = (await response.json()) as ApifyRun;
+    const status = runData.data.status as ApifyRunStatus;
+
+    if (status === 'SUCCEEDED') {
       return {
-        id: run.id,
-        defaultDatasetId: run.defaultDatasetId ?? null,
+        defaultDatasetId: runData.data.defaultDatasetId ?? null,
       };
     }
 
-    if (run.status === 'FAILED' || run.status === 'ABORTED' || run.status === 'TIMED-OUT') {
-      throw new Error(`Apify run ${runId} failed with status: ${run.status}`);
+    if (status === 'FAILED' || status === 'ABORTED' || status === 'TIMED-OUT') {
+      throw new Error(`Apify run ${runId} failed with status: ${status}`);
     }
 
     if (Date.now() - startTime > maxWaitTime) {
@@ -95,15 +130,18 @@ async function waitForRunCompletion(
 /**
  * Gets dataset items from a completed Apify run
  */
-async function getDatasetItems(datasetId: string): Promise<ApifyDatasetItem[]> {
-  const client = getApifyClient();
+async function getDatasetItems<T>(datasetId: string): Promise<T[]> {
+  const env = getEnv();
+  const url = `https://api.apify.com/v2/datasets/${datasetId}/items?token=${encodeURIComponent(env.apifyApiToken)}`;
 
-  if (!datasetId) {
-    throw new Error(`Dataset ID is required`);
+  const response = await fetch(url);
+
+  if (!response.ok) {
+    throw new Error(`Failed to get dataset items: ${response.status}`);
   }
 
-  const { items } = await client.dataset(datasetId).listItems();
-  return items as ApifyDatasetItem[];
+  const items = (await response.json()) as T[];
+  return items;
 }
 
 /**
@@ -111,156 +149,157 @@ async function getDatasetItems(datasetId: string): Promise<ApifyDatasetItem[]> {
  */
 async function storeProfileData(
   userId: string,
-  profileData: ApifyProfileOutput
+  profileData: ApifyLinkedinProfile
 ): Promise<LinkedInProfile> {
-  const client = await getDatabaseClient();
-  try {
-    // Extract common fields from Apify output
-    // Structure may vary by actor, so we extract what we can
-    const headline =
-      typeof profileData.headline === 'string' ? profileData.headline : null;
-    const about =
-      typeof profileData.about === 'string' ? profileData.about : null;
-    const location =
-      typeof profileData.location === 'string' ? profileData.location : null;
-    const experience =
-      profileData.experience && typeof profileData.experience === 'object'
-        ? profileData.experience
-        : null;
+  const supabase = getSupabaseAdminClient();
 
-    // Check if profile already exists for this user
-    const existing = await client.query<LinkedInProfile>(
-      'SELECT * FROM linkedin_profiles WHERE user_id = $1',
-      [userId]
-    );
+  // Extract fields from Apify profile response structure
+  const basicInfo = profileData.basic_info || {};
+  const headline = typeof basicInfo.headline === 'string' ? basicInfo.headline : null;
+  const about = typeof basicInfo.about === 'string' ? basicInfo.about : null;
+  const location = basicInfo.location?.full && typeof basicInfo.location.full === 'string'
+    ? basicInfo.location.full
+    : null;
+  const experience = Array.isArray(profileData.experience) ? profileData.experience : null;
 
-    let result;
-    if (existing.rows.length > 0) {
-      // Update existing profile
-      result = await client.query<LinkedInProfile>(
-        `UPDATE linkedin_profiles SET
-          headline = $2,
-          about = $3,
-          location = $4,
-          experience_json = $5,
-          raw_json = $6,
-          updated_at = NOW()
-        WHERE user_id = $1
-        RETURNING *`,
-        [
-          userId,
-          headline,
-          about,
-          location,
-          experience ? JSON.stringify(experience) : null,
-          JSON.stringify(profileData),
-        ]
-      );
-    } else {
-      // Insert new profile
-      result = await client.query<LinkedInProfile>(
-        `INSERT INTO linkedin_profiles (
-          user_id, headline, about, location, experience_json, raw_json, created_at, updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
-        RETURNING *`,
-        [
-          userId,
-          headline,
-          about,
-          location,
-          experience ? JSON.stringify(experience) : null,
-          JSON.stringify(profileData),
-        ]
-      );
+  // Check if profile already exists for this user
+  const { data: existingData } = await supabase
+    .from('linkedin_profiles')
+    .select('*')
+    .eq('user_id', userId)
+    .single();
+
+  const now = new Date().toISOString();
+
+  if (existingData) {
+    // Update existing profile
+    const { data, error } = await supabase
+      .from('linkedin_profiles')
+      .update({
+        headline,
+        about,
+        location,
+        experience_json: experience || null,
+        raw_json: profileData,
+        updated_at: now,
+      })
+      .eq('user_id', userId)
+      .select()
+      .single();
+
+    if (error) {
+      throw new Error(`Error updating profile: ${error.message}`);
     }
 
-    if (result.rows.length === 0) {
+    if (!data) {
+      throw new Error('Failed to update profile data');
+    }
+
+    return data as LinkedInProfile;
+  } else {
+    // Insert new profile
+    const { data, error } = await supabase
+      .from('linkedin_profiles')
+      .insert({
+        user_id: userId,
+        headline,
+        about,
+        location,
+        experience_json: experience || null,
+        raw_json: profileData,
+        created_at: now,
+        updated_at: now,
+      })
+      .select()
+      .single();
+
+    if (error) {
+      throw new Error(`Error creating profile: ${error.message}`);
+    }
+
+    if (!data) {
       throw new Error('Failed to insert profile data');
     }
 
-    return result.rows[0];
-  } finally {
-    client.release();
+    return data as LinkedInProfile;
   }
 }
 
 /**
  * Parses Apify posts output and stores in linkedin_posts
+ * Only inserts posts where text is a non-empty string
  */
 async function storePostsData(
   userId: string,
-  postsData: ApifyPostOutput[]
+  postsData: ApifyLinkedinPost[]
 ): Promise<LinkedInPost[]> {
-  const client = await getDatabaseClient();
-  try {
-    const storedPosts: LinkedInPost[] = [];
+  const supabase = getSupabaseAdminClient();
+  const storedPosts: LinkedInPost[] = [];
+  const now = new Date().toISOString();
 
-    for (const postData of postsData) {
-      // Extract post fields from Apify output
-      const rawText =
-        typeof postData.text === 'string' ? postData.text : null;
-      const cleanedText = rawText ? cleanLinkedInPostText(rawText) : null;
+  for (const postData of postsData) {
+    // Only insert posts where text is a non-empty string
+    const rawText = typeof postData.text === 'string' && postData.text.trim().length > 0
+      ? postData.text
+      : null;
 
-      // Parse posted date if available
-      let postedAt: string | null = null;
-      if (postData.postedAt) {
-        if (typeof postData.postedAt === 'string') {
-          postedAt = postData.postedAt;
-        } else if (postData.postedAt instanceof Date) {
-          postedAt = postData.postedAt.toISOString();
-        }
-      }
-
-      const likesCount =
-        typeof postData.likes === 'number' ? postData.likes : 0;
-      const commentsCount =
-        typeof postData.comments === 'number' ? postData.comments : 0;
-      const sharesCount =
-        typeof postData.shares === 'number' ? postData.shares : 0;
-      const impressionsCount =
-        typeof postData.impressions === 'number'
-          ? postData.impressions
-          : null;
-
-      // Calculate engagement score (simple sum for now)
-      const engagementScore = likesCount + commentsCount + sharesCount;
-
-      // Default values
-      const isHighPerforming = false;
-      const topicHint = null;
-
-      const result = await client.query<LinkedInPost>(
-        `INSERT INTO linkedin_posts (
-          user_id, text, raw_text, posted_at, likes_count, comments_count,
-          shares_count, impressions_count, engagement_score, is_high_performing,
-          topic_hint, raw_json, created_at, updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), NOW())
-        RETURNING *`,
-        [
-          userId,
-          cleanedText,
-          rawText,
-          postedAt,
-          likesCount,
-          commentsCount,
-          sharesCount,
-          impressionsCount,
-          engagementScore,
-          isHighPerforming,
-          topicHint,
-          JSON.stringify(postData),
-        ]
-      );
-
-      if (result.rows.length > 0) {
-        storedPosts.push(result.rows[0]);
-      }
+    if (!rawText) {
+      continue; // Skip posts without text
     }
 
-    return storedPosts;
-  } finally {
-    client.release();
+    const cleanedText = cleanLinkedInPostText(rawText);
+
+    // Parse posted date from postedAtISO
+    let postedAt: string | null = null;
+    if (postData.postedAtISO && typeof postData.postedAtISO === 'string') {
+      postedAt = postData.postedAtISO;
+    }
+
+    // Map response fields to database fields
+    const likesCount = typeof postData.numLikes === 'number' ? postData.numLikes : 0;
+    const commentsCount = typeof postData.numComments === 'number' ? postData.numComments : 0;
+    const sharesCount = typeof postData.numShares === 'number' ? postData.numShares : 0;
+    // impressions_count is not present in response, set to null
+    const impressionsCount = null;
+
+    // engagement_score and is_high_performing will be set later in analysis step
+    // topic_hint will be set later
+    const engagementScore = 0; // Will be calculated in analysis
+    const isHighPerforming = false; // Will be set in analysis
+    const topicHint = null; // Will be set later
+
+    const { data, error } = await supabase
+      .from('linkedin_posts')
+      .insert({
+        user_id: userId,
+        text: cleanedText,
+        raw_text: rawText,
+        posted_at: postedAt,
+        likes_count: likesCount,
+        comments_count: commentsCount,
+        shares_count: sharesCount,
+        impressions_count: impressionsCount,
+        engagement_score: engagementScore,
+        is_high_performing: isHighPerforming,
+        topic_hint: topicHint,
+        raw_json: postData,
+        created_at: now,
+        updated_at: now,
+      })
+      .select()
+      .single();
+
+    if (error) {
+      console.error(`Error inserting post: ${error.message}`);
+      continue;
+    }
+
+    if (data) {
+      storedPosts.push(data as LinkedInPost);
+    }
   }
+
+  return storedPosts;
 }
 
 /**
@@ -271,26 +310,21 @@ export async function ingestLinkedInData(
   userId: string,
   linkedinUrl: string
 ): Promise<IngestionResult> {
-  const profileActorId = process.env.APIFY_LINKEDIN_PROFILE_ACTOR_ID;
-  const postsActorId = process.env.APIFY_LINKEDIN_POSTS_ACTOR_ID;
-
-  if (!profileActorId || !postsActorId) {
-    throw new Error(
-      'APIFY_LINKEDIN_PROFILE_ACTOR_ID and APIFY_LINKEDIN_POSTS_ACTOR_ID must be set'
-    );
-  }
-
   try {
+    // Set onboarding status to scraping_in_progress at start
+    const scrapingStatus: OnboardingStatus = 'scraping_in_progress';
+    await updateOnboardingStatus(userId, scrapingStatus);
+
     // Trigger both actors concurrently
     const [profileRun, postsRun] = await Promise.all([
-      triggerActor(profileActorId, linkedinUrl),
-      triggerActor(postsActorId, linkedinUrl),
+      triggerProfileActor(linkedinUrl),
+      triggerPostsActor(linkedinUrl),
     ]);
 
     // Wait for both runs to complete
     const [completedProfileRun, completedPostsRun] = await Promise.all([
-      waitForRunCompletion(profileActorId, profileRun.id),
-      waitForRunCompletion(postsActorId, postsRun.id),
+      waitForRunCompletion(profileRun.id),
+      waitForRunCompletion(postsRun.id),
     ]);
 
     // Get dataset items from both runs
@@ -298,27 +332,25 @@ export async function ingestLinkedInData(
       throw new Error('One or both runs completed without a dataset');
     }
 
-    const [profileItems, postsItems] = await Promise.all([
-      getDatasetItems(completedProfileRun.defaultDatasetId),
-      getDatasetItems(completedPostsRun.defaultDatasetId),
+    const [profileResponse, postsResponse] = await Promise.all([
+      getDatasetItems<ApifyLinkedinProfile>(completedProfileRun.defaultDatasetId),
+      getDatasetItems<ApifyLinkedinPost>(completedPostsRun.defaultDatasetId),
     ]);
 
-    // Store profile data (expecting single item or array with one item)
-    if (profileItems.length > 0) {
-      const profileData = Array.isArray(profileItems[0])
-        ? profileItems[0]
-        : profileItems[0];
-      await storeProfileData(userId, profileData as ApifyProfileOutput);
+    // Store profile data - response is an array, use the first element
+    if (profileResponse.length > 0) {
+      const profileData = profileResponse[0];
+      await storeProfileData(userId, profileData);
+    } else {
+      throw new Error('Profile actor returned no data');
     }
 
-    // Store posts data (expecting array of items)
-    // Apify typically returns an array, but we handle both cases
-    const postsArray = Array.isArray(postsItems) ? postsItems : [postsItems];
-    if (postsArray.length > 0 && postsArray[0] !== null && postsArray[0] !== undefined) {
-      await storePostsData(userId, postsArray as ApifyPostOutput[]);
+    // Store posts data - response is an array of posts
+    if (postsResponse.length > 0) {
+      await storePostsData(userId, postsResponse);
     }
 
-    // Update onboarding status to analysis_in_progress
+    // Update onboarding status to analysis_in_progress on success
     const analysisStatus: OnboardingStatus = 'analysis_in_progress';
     await updateOnboardingStatus(userId, analysisStatus);
 
@@ -335,12 +367,16 @@ export async function ingestLinkedInData(
 
     return { success: true };
   } catch (error) {
-    // Set onboarding status to error
+    // Set onboarding status to error on failure
     const errorStatus: OnboardingStatus = 'error';
-    await updateOnboardingStatus(userId, errorStatus);
+    await updateOnboardingStatus(userId, errorStatus).catch((updateError) => {
+      console.error('Error updating status to error:', updateError);
+    });
 
-    const errorMessage =
-      error instanceof Error ? error.message : 'Unknown error occurred';
+    // Log error safely (no tokens)
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
+    console.error('LinkedIn ingestion error:', errorMessage);
+
     return {
       success: false,
       error: errorMessage,

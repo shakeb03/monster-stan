@@ -4,7 +4,7 @@
  */
 
 import { updateContentStrategy, updatePastWins } from '@/lib/ai/memory-summarizer';
-import { queryDatabase } from '@/lib/db';
+import { getSupabaseAdminClient } from '@/lib/db';
 import type { LinkedInPost, StyleProfile, StyleJson, ChatMessage } from '@/lib/types';
 
 /**
@@ -16,35 +16,51 @@ export async function updateMemoryAfterInteraction(
   chatMessages: ChatMessage[]
 ): Promise<void> {
   try {
-    // Get posts and style profile
-    const posts = await queryDatabase<LinkedInPost>(
-      'SELECT * FROM linkedin_posts WHERE user_id = $1 ORDER BY engagement_score DESC',
-      [userId]
-    );
+    const supabase = getSupabaseAdminClient();
 
-    const styleProfiles = await queryDatabase<StyleProfile>(
-      'SELECT * FROM style_profiles WHERE user_id = $1 LIMIT 1',
-      [userId]
-    );
+    // Get posts
+    const { data: postsData, error: postsError } = await supabase
+      .from('linkedin_posts')
+      .select('*')
+      .eq('user_id', userId)
+      .order('engagement_score', { ascending: false });
+
+    if (postsError) {
+      throw new Error(`Error fetching posts: ${postsError.message}`);
+    }
+
+    const posts = (postsData as LinkedInPost[]) || [];
+
+    // Get style profile
+    const { data: styleProfilesData, error: styleError } = await supabase
+      .from('style_profiles')
+      .select('*')
+      .eq('user_id', userId)
+      .limit(1)
+      .single();
+
     // Validate and cast style_json
     let styleProfile: StyleJson | null = null;
-    if (styleProfiles.length > 0 && styleProfiles[0].style_json && typeof styleProfiles[0].style_json === 'object') {
-      const json = styleProfiles[0].style_json as unknown;
-      if (
-        json !== null &&
-        typeof json === 'object' &&
-        'tone' in json &&
-        'formality_level' in json &&
-        'average_length_words' in json &&
-        'emoji_usage' in json &&
-        'structure_patterns' in json &&
-        'hook_patterns' in json &&
-        'hashtag_style' in json &&
-        'favorite_topics' in json &&
-        'common_phrases_or_cadence_examples' in json &&
-        'paragraph_density' in json
-      ) {
-        styleProfile = json as StyleJson;
+    if (!styleError && styleProfilesData) {
+      const profile = styleProfilesData as StyleProfile;
+      if (profile.style_json && typeof profile.style_json === 'object') {
+        const json = profile.style_json as unknown;
+        if (
+          json !== null &&
+          typeof json === 'object' &&
+          'tone' in json &&
+          'formality_level' in json &&
+          'average_length_words' in json &&
+          'emoji_usage' in json &&
+          'structure_patterns' in json &&
+          'hook_patterns' in json &&
+          'hashtag_style' in json &&
+          'favorite_topics' in json &&
+          'common_phrases_or_cadence_examples' in json &&
+          'paragraph_density' in json
+        ) {
+          styleProfile = json as StyleJson;
+        }
       }
     }
 

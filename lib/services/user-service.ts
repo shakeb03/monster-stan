@@ -3,7 +3,7 @@
  * Business logic for ensuring users and user_profile rows exist
  */
 
-import { getDatabaseClient, queryDatabase } from '@/lib/db';
+import { getSupabaseAdminClient } from '@/lib/db';
 import type { User, UserProfile, OnboardingStatus } from '@/lib/types';
 
 /**
@@ -13,28 +13,44 @@ export async function ensureUserExists(
   userId: string,
   email: string
 ): Promise<User> {
-  const client = await getDatabaseClient();
-  try {
-    // Check if user exists
-    const existingUser = await client.query<User>(
-      'SELECT * FROM users WHERE id = $1',
-      [userId]
-    );
+  const supabase = getSupabaseAdminClient();
 
-    if (existingUser.rows.length > 0) {
-      return existingUser.rows[0];
-    }
+  // Check if user exists
+  const { data: existingUser, error: fetchError } = await supabase
+    .from('users')
+    .select('*')
+    .eq('id', userId)
+    .single();
 
-    // Create new user
-    const result = await client.query<User>(
-      'INSERT INTO users (id, email, created_at) VALUES ($1, $2, NOW()) RETURNING *',
-      [userId, email]
-    );
-
-    return result.rows[0];
-  } finally {
-    client.release();
+  if (fetchError && fetchError.code !== 'PGRST116') {
+    // PGRST116 is "not found" - ignore it, we'll create the user
+    throw new Error(`Error checking user existence: ${fetchError.message}`);
   }
+
+  if (existingUser) {
+    return existingUser as User;
+  }
+
+  // Create new user
+  const { data: newUser, error: insertError } = await supabase
+    .from('users')
+    .insert({
+      id: userId,
+      email,
+      created_at: new Date().toISOString(),
+    })
+    .select()
+    .single();
+
+  if (insertError) {
+    throw new Error(`Error creating user: ${insertError.message}`);
+  }
+
+  if (!newUser) {
+    throw new Error('Failed to create user');
+  }
+
+  return newUser as User;
 }
 
 /**
@@ -43,43 +59,71 @@ export async function ensureUserExists(
 export async function ensureUserProfileExists(
   userId: string
 ): Promise<UserProfile> {
-  const client = await getDatabaseClient();
-  try {
-    // Check if user_profile exists
-    const existingProfile = await client.query<UserProfile>(
-      'SELECT * FROM user_profile WHERE user_id = $1',
-      [userId]
-    );
+  const supabase = getSupabaseAdminClient();
 
-    if (existingProfile.rows.length > 0) {
-      return existingProfile.rows[0];
-    }
+  // Check if user_profile exists
+  const { data: existingProfile, error: fetchError } = await supabase
+    .from('user_profile')
+    .select('*')
+    .eq('user_id', userId)
+    .single();
 
-    // Create new user_profile with default onboarding_status
-    const defaultStatus: OnboardingStatus = 'linkedin_url_pending';
-    const result = await client.query<UserProfile>(
-      `INSERT INTO user_profile (user_id, onboarding_status, created_at, updated_at)
-       VALUES ($1, $2, NOW(), NOW())
-       RETURNING *`,
-      [userId, defaultStatus]
-    );
-
-    return result.rows[0];
-  } finally {
-    client.release();
+  if (fetchError && fetchError.code !== 'PGRST116') {
+    // PGRST116 is "not found" - ignore it, we'll create the profile
+    throw new Error(`Error checking user profile existence: ${fetchError.message}`);
   }
+
+  if (existingProfile) {
+    return existingProfile as UserProfile;
+  }
+
+  // Create new user_profile with default onboarding_status
+  const defaultStatus: OnboardingStatus = 'linkedin_url_pending';
+  const now = new Date().toISOString();
+
+  const { data: newProfile, error: insertError } = await supabase
+    .from('user_profile')
+    .insert({
+      user_id: userId,
+      onboarding_status: defaultStatus,
+      created_at: now,
+      updated_at: now,
+    })
+    .select()
+    .single();
+
+  if (insertError) {
+    throw new Error(`Error creating user profile: ${insertError.message}`);
+  }
+
+  if (!newProfile) {
+    throw new Error('Failed to create user profile');
+  }
+
+  return newProfile as UserProfile;
 }
 
 /**
  * Gets the user profile for a user
  */
 export async function getUserProfile(userId: string): Promise<UserProfile | null> {
-  const profiles = await queryDatabase<UserProfile>(
-    'SELECT * FROM user_profile WHERE user_id = $1',
-    [userId]
-  );
+  const supabase = getSupabaseAdminClient();
 
-  return profiles.length > 0 ? profiles[0] : null;
+  const { data, error } = await supabase
+    .from('user_profile')
+    .select('*')
+    .eq('user_id', userId)
+    .single();
+
+  if (error) {
+    if (error.code === 'PGRST116') {
+      // Not found - return null
+      return null;
+    }
+    throw new Error(`Error fetching user profile: ${error.message}`);
+  }
+
+  return data as UserProfile | null;
 }
 
 /**
@@ -89,24 +133,27 @@ export async function updateOnboardingStatus(
   userId: string,
   status: OnboardingStatus
 ): Promise<UserProfile> {
-  const client = await getDatabaseClient();
-  try {
-    const result = await client.query<UserProfile>(
-      `UPDATE user_profile
-       SET onboarding_status = $1, updated_at = NOW()
-       WHERE user_id = $2
-       RETURNING *`,
-      [status, userId]
-    );
+  const supabase = getSupabaseAdminClient();
 
-    if (result.rows.length === 0) {
-      throw new Error(`User profile not found for user ${userId}`);
-    }
+  const { data, error } = await supabase
+    .from('user_profile')
+    .update({
+      onboarding_status: status,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('user_id', userId)
+    .select()
+    .single();
 
-    return result.rows[0];
-  } finally {
-    client.release();
+  if (error) {
+    throw new Error(`Error updating onboarding status: ${error.message}`);
   }
+
+  if (!data) {
+    throw new Error(`User profile not found for user ${userId}`);
+  }
+
+  return data as UserProfile;
 }
 
 /**
@@ -116,23 +163,26 @@ export async function updateLinkedInUrl(
   userId: string,
   linkedinUrl: string
 ): Promise<UserProfile> {
-  const client = await getDatabaseClient();
-  try {
-    const result = await client.query<UserProfile>(
-      `UPDATE user_profile
-       SET linkedin_url = $1, updated_at = NOW()
-       WHERE user_id = $2
-       RETURNING *`,
-      [linkedinUrl, userId]
-    );
+  const supabase = getSupabaseAdminClient();
 
-    if (result.rows.length === 0) {
-      throw new Error(`User profile not found for user ${userId}`);
-    }
+  const { data, error } = await supabase
+    .from('user_profile')
+    .update({
+      linkedin_url: linkedinUrl,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('user_id', userId)
+    .select()
+    .single();
 
-    return result.rows[0];
-  } finally {
-    client.release();
+  if (error) {
+    throw new Error(`Error updating LinkedIn URL: ${error.message}`);
   }
+
+  if (!data) {
+    throw new Error(`User profile not found for user ${userId}`);
+  }
+
+  return data as UserProfile;
 }
 

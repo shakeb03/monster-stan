@@ -12,7 +12,7 @@ import {
   createChatMessage,
 } from '@/lib/services/chat-service';
 import { getUserMemory } from '@/lib/services/memory-service';
-import { queryDatabase } from '@/lib/db';
+import { getSupabaseAdminClient } from '@/lib/db';
 import type { StyleProfile, StyleJson } from '@/lib/types';
 
 export async function POST(
@@ -48,11 +48,14 @@ export async function POST(
     const chatHistory = await getChatMessages(chatId);
 
     // Get style profile
-    const styleProfiles = await queryDatabase<StyleProfile>(
-      'SELECT * FROM style_profiles WHERE user_id = $1 LIMIT 1',
-      [userId]
-    );
-    const styleProfile = styleProfiles.length > 0 ? styleProfiles[0] : null;
+    const supabase = getSupabaseAdminClient();
+    const { data: styleProfileData } = await supabase
+      .from('style_profiles')
+      .select('*')
+      .eq('user_id', userId)
+      .limit(1)
+      .single();
+    const styleProfile = styleProfileData as StyleProfile | null;
     // Validate and cast style_json
     let styleJson: StyleJson | null = null;
     if (styleProfile?.style_json && typeof styleProfile.style_json === 'object') {

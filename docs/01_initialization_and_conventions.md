@@ -67,19 +67,30 @@ Cursor must maintain this structure.
 
 Cursor must reference but never hard-code:
 
+```env
+# Clerk
+NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=
+CLERK_SECRET_KEY=
+
+# Supabase
+NEXT_PUBLIC_SUPABASE_URL=
+NEXT_PUBLIC_SUPABASE_ANON_KEY=
+SUPABASE_SERVICE_ROLE_KEY=
+
+# OpenAI
+OPENAI_API_KEY=
+
+# Apify
+APIFY_API_TOKEN=
+APIFY_LINKEDIN_PROFILE_ACTOR_ID=
+APIFY_LINKEDIN_POSTS_ACTOR_ID=
 ```
-CLERK_PUBLISHABLE_KEY
-CLERK_SECRET_KEY
-NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY
 
-DATABASE_URL
-
-APIFY_TOKEN
-APIFY_LINKEDIN_PROFILE_ACTOR_ID
-APIFY_LINKEDIN_POSTS_ACTOR_ID
-
-OPENAI_API_KEY
-```
+**Database Access:**
+- All database operations use the Supabase JS client (`@supabase/supabase-js`).
+- Server-side operations use `SUPABASE_SERVICE_ROLE_KEY` for admin-level access (via `getSupabaseAdminClient()`).
+- The service role key has elevated permissions and must NEVER be exposed to the client.
+- Client-side operations (if needed) should use `NEXT_PUBLIC_SUPABASE_ANON_KEY` with Row Level Security (RLS) policies.
 
 ---
 

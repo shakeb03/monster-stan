@@ -1,54 +1,34 @@
 /**
  * Database client for Supabase Postgres
- * Uses the DATABASE_URL environment variable for direct Postgres connection
+ * Uses Supabase JS client library for all database operations
  */
 
-import { Pool, PoolClient } from 'pg';
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import {
+  getSupabaseUrl,
+  getSupabaseServiceRoleKey,
+} from '@/lib/config/env';
 
-let pool: Pool | null = null;
+let supabaseAdminClient: SupabaseClient | null = null;
 
 /**
- * Gets or creates a Postgres connection pool
+ * Gets or creates a Supabase admin client for server-side operations
+ * Uses the service role key for elevated permissions
+ * This client should only be used on the server side, never exposed to the client
  */
-export function getDatabasePool(): Pool {
-  if (!pool) {
-    if (!process.env.DATABASE_URL) {
-      throw new Error('DATABASE_URL environment variable is required');
-    }
+export function getSupabaseAdminClient(): SupabaseClient {
+  if (!supabaseAdminClient) {
+    const url = getSupabaseUrl();
+    const serviceRoleKey = getSupabaseServiceRoleKey();
 
-    pool = new Pool({
-      connectionString: process.env.DATABASE_URL,
-      ssl: process.env.DATABASE_URL.includes('supabase.co')
-        ? { rejectUnauthorized: false }
-        : undefined,
+    supabaseAdminClient = createClient(url, serviceRoleKey, {
+      auth: {
+        autoRefreshToken: false,
+        persistSession: false,
+      },
     });
   }
 
-  return pool;
-}
-
-/**
- * Gets a database client from the pool
- * Use this for database queries
- */
-export async function getDatabaseClient(): Promise<PoolClient> {
-  const pool = getDatabasePool();
-  return pool.connect();
-}
-
-/**
- * Executes a query with proper error handling
- */
-export async function queryDatabase<T = unknown>(
-  query: string,
-  params?: unknown[]
-): Promise<T[]> {
-  const client = await getDatabaseClient();
-  try {
-    const result = await client.query(query, params);
-    return result.rows as T[];
-  } finally {
-    client.release();
-  }
+  return supabaseAdminClient;
 }
 

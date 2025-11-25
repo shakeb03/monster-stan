@@ -6,7 +6,7 @@
 import OpenAI from 'openai';
 import { retrieveRelevantPosts } from '@/lib/ai/rag';
 import { getUserMemory } from '@/lib/services/memory-service';
-import { queryDatabase } from '@/lib/db';
+import { getSupabaseAdminClient } from '@/lib/db';
 import {
   buildCompletePrompt,
   buildStyleBlock,
@@ -38,15 +38,14 @@ interface OrchestratorOutput {
   metadata?: Record<string, unknown>;
 }
 
+import { getEnv } from '@/lib/config/env';
+
 /**
  * Gets OpenAI client
  */
 function getOpenAIClient(): OpenAI {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    throw new Error('OPENAI_API_KEY environment variable is required');
-  }
-  return new OpenAI({ apiKey });
+  const env = getEnv();
+  return new OpenAI({ apiKey: env.openaiApiKey });
 }
 
 /**
@@ -491,7 +490,14 @@ export async function orchestrateResponse(
   // Step 2: Retrieve RAG posts if needed
   let ragPosts: LinkedInPost[] = [];
   if (classification.requires_rag) {
-    ragPosts = await retrieveRelevantPosts(userId, userMessage, 5);
+    try {
+      ragPosts = await retrieveRelevantPosts(userId, userMessage, 5);
+    } catch (error) {
+      // Log error but continue without RAG posts
+      // The FACTS block will note that no relevant posts were found
+      console.error('Error retrieving RAG posts:', error instanceof Error ? error.message : 'Unknown error');
+      ragPosts = [];
+    }
   }
 
   // Step 3: Load LinkedIn profile if needed
@@ -500,11 +506,17 @@ export async function orchestrateResponse(
     classification.intent === 'ANALYZE_PROFILE' ||
     classification.intent === 'WRITE_POST'
   ) {
-    const profiles = await queryDatabase<LinkedInProfile>(
-      'SELECT * FROM linkedin_profiles WHERE user_id = $1 LIMIT 1',
-      [userId]
-    );
-    profile = profiles.length > 0 ? profiles[0] : null;
+    const supabase = getSupabaseAdminClient();
+    const { data, error } = await supabase
+      .from('linkedin_profiles')
+      .select('*')
+      .eq('user_id', userId)
+      .limit(1)
+      .single();
+
+    if (!error && data) {
+      profile = data as LinkedInProfile;
+    }
   }
 
   // Step 4: Generate response based on intent

@@ -2,17 +2,26 @@
  * Memory service for managing long-term memory entries
  */
 
-import { getDatabaseClient, queryDatabase } from '@/lib/db';
+import { getSupabaseAdminClient } from '@/lib/db';
 import type { LongTermMemory, SummaryType } from '@/lib/types';
 
 /**
  * Gets all memory entries for a user
  */
 export async function getUserMemory(userId: string): Promise<LongTermMemory[]> {
-  return queryDatabase<LongTermMemory>(
-    'SELECT * FROM long_term_memory WHERE user_id = $1 ORDER BY updated_at DESC',
-    [userId]
-  );
+  const supabase = getSupabaseAdminClient();
+
+  const { data, error } = await supabase
+    .from('long_term_memory')
+    .select('*')
+    .eq('user_id', userId)
+    .order('updated_at', { ascending: false });
+
+  if (error) {
+    throw new Error(`Error fetching user memory: ${error.message}`);
+  }
+
+  return (data as LongTermMemory[]) || [];
 }
 
 /**
@@ -22,10 +31,20 @@ export async function getMemoryByType(
   userId: string,
   summaryType: SummaryType
 ): Promise<LongTermMemory[]> {
-  return queryDatabase<LongTermMemory>(
-    'SELECT * FROM long_term_memory WHERE user_id = $1 AND summary_type = $2 ORDER BY updated_at DESC',
-    [userId, summaryType]
-  );
+  const supabase = getSupabaseAdminClient();
+
+  const { data, error } = await supabase
+    .from('long_term_memory')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('summary_type', summaryType)
+    .order('updated_at', { ascending: false });
+
+  if (error) {
+    throw new Error(`Error fetching memory by type: ${error.message}`);
+  }
+
+  return (data as LongTermMemory[]) || [];
 }
 
 /**
@@ -47,42 +66,58 @@ export async function upsertMemory(
   summaryType: SummaryType,
   content: string | Record<string, unknown>
 ): Promise<LongTermMemory> {
-  const client = await getDatabaseClient();
-  try {
-    // Check if entry exists
-    const existing = await getMemoryEntry(userId, summaryType);
+  const supabase = getSupabaseAdminClient();
 
-    let result;
-    if (existing) {
-      // Update existing entry
-      const contentValue =
-        typeof content === 'string' ? content : JSON.stringify(content);
-      result = await client.query<LongTermMemory>(
-        `UPDATE long_term_memory
-         SET content = $1, updated_at = NOW()
-         WHERE id = $2
-         RETURNING *`,
-        [contentValue, existing.id]
-      );
-    } else {
-      // Create new entry
-      const contentValue =
-        typeof content === 'string' ? content : JSON.stringify(content);
-      result = await client.query<LongTermMemory>(
-        `INSERT INTO long_term_memory (user_id, summary_type, content, updated_at)
-         VALUES ($1, $2, $3, NOW())
-         RETURNING *`,
-        [userId, summaryType, contentValue]
-      );
+  // Check if entry exists
+  const existing = await getMemoryEntry(userId, summaryType);
+
+  const contentValue =
+    typeof content === 'string' ? content : JSON.stringify(content);
+  const now = new Date().toISOString();
+
+  if (existing) {
+    // Update existing entry
+    const { data, error } = await supabase
+      .from('long_term_memory')
+      .update({
+        content: contentValue,
+        updated_at: now,
+      })
+      .eq('id', existing.id)
+      .select()
+      .single();
+
+    if (error) {
+      throw new Error(`Error updating memory entry: ${error.message}`);
     }
 
-    if (result.rows.length === 0) {
-      throw new Error('Failed to upsert memory entry');
+    if (!data) {
+      throw new Error('Failed to update memory entry');
     }
 
-    return result.rows[0];
-  } finally {
-    client.release();
+    return data as LongTermMemory;
+  } else {
+    // Create new entry
+    const { data, error } = await supabase
+      .from('long_term_memory')
+      .insert({
+        user_id: userId,
+        summary_type: summaryType,
+        content: contentValue,
+        updated_at: now,
+      })
+      .select()
+      .single();
+
+    if (error) {
+      throw new Error(`Error creating memory entry: ${error.message}`);
+    }
+
+    if (!data) {
+      throw new Error('Failed to create memory entry');
+    }
+
+    return data as LongTermMemory;
   }
 }
 

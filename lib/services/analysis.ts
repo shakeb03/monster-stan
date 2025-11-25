@@ -4,7 +4,7 @@
  */
 
 import OpenAI from 'openai';
-import { getDatabaseClient, queryDatabase } from '@/lib/db';
+import { getSupabaseAdminClient } from '@/lib/db';
 import { updateOnboardingStatus } from '@/lib/services/user-service';
 import type {
   LinkedInPost,
@@ -21,15 +21,14 @@ interface AnalysisResult {
   error?: string;
 }
 
+import { getEnv } from '@/lib/config/env';
+
 /**
  * Gets OpenAI client instance
  */
 function getOpenAIClient(): OpenAI {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    throw new Error('OPENAI_API_KEY environment variable is required');
-  }
-  return new OpenAI({ apiKey });
+  const env = getEnv();
+  return new OpenAI({ apiKey: env.openaiApiKey });
 }
 
 /**
@@ -66,38 +65,42 @@ async function updateEngagementScores(
     return;
   }
 
-  const client = await getDatabaseClient();
-  try {
-    // Compute scores for all posts
-    const postsWithScores = posts.map((post) => ({
-      ...post,
-      engagement_score: computeEngagementScore(post),
-    }));
+  const supabase = getSupabaseAdminClient();
 
-    // Sort by engagement score descending
-    postsWithScores.sort((a, b) => b.engagement_score - a.engagement_score);
+  // Compute scores for all posts
+  const postsWithScores = posts.map((post) => ({
+    ...post,
+    engagement_score: computeEngagementScore(post),
+  }));
 
-    // Mark top 25-35% as high performing (using 30% as middle ground)
-    const topPercent = 0.3;
-    const highPerformingCount = Math.max(
-      1,
-      Math.ceil(postsWithScores.length * topPercent)
-    );
+  // Sort by engagement score descending
+  postsWithScores.sort((a, b) => b.engagement_score - a.engagement_score);
 
-    // Update all posts with scores and high-performing flags
-    for (let i = 0; i < postsWithScores.length; i++) {
-      const post = postsWithScores[i];
-      const isHighPerforming = i < highPerformingCount;
+  // Mark top 25-35% as high performing (using 30% as middle ground)
+  const topPercent = 0.3;
+  const highPerformingCount = Math.max(
+    1,
+    Math.ceil(postsWithScores.length * topPercent)
+  );
 
-      await client.query(
-        `UPDATE linkedin_posts
-         SET engagement_score = $1, is_high_performing = $2, updated_at = NOW()
-         WHERE id = $3`,
-        [post.engagement_score, isHighPerforming, post.id]
-      );
+  // Update all posts with scores and high-performing flags
+  const now = new Date().toISOString();
+  for (let i = 0; i < postsWithScores.length; i++) {
+    const post = postsWithScores[i];
+    const isHighPerforming = i < highPerformingCount;
+
+    const { error } = await supabase
+      .from('linkedin_posts')
+      .update({
+        engagement_score: post.engagement_score,
+        is_high_performing: isHighPerforming,
+        updated_at: now,
+      })
+      .eq('id', post.id);
+
+    if (error) {
+      console.error(`Error updating engagement score for post ${post.id}:`, error);
     }
-  } finally {
-    client.release();
   }
 }
 
@@ -130,56 +133,65 @@ async function generateAndStoreEmbeddings(
   posts: LinkedInPost[],
   profileAbout: string | null
 ): Promise<void> {
-  const client = await getDatabaseClient();
-  try {
-    // Generate embeddings for posts
-    for (const post of posts) {
-      if (!post.text || post.text.trim().length === 0) {
-        continue;
-      }
+  const supabase = getSupabaseAdminClient();
 
-      try {
-        const embedding = await generateEmbedding(post.text);
-
-        // Check if embedding already exists
-        const existing = await client.query<PostEmbedding>(
-          'SELECT * FROM post_embeddings WHERE post_id = $1',
-          [post.id]
-        );
-
-        // pgvector expects the embedding as an array
-        // The pg library will handle the conversion to vector type
-
-        if (existing.rows.length > 0) {
-          // Update existing embedding
-          await client.query(
-            `UPDATE post_embeddings
-             SET embedding = $1::vector
-             WHERE post_id = $2`,
-            [`[${embedding.join(',')}]`, post.id]
-          );
-        } else {
-          // Insert new embedding
-          // pgvector accepts array format as string '[1,2,3]' and casts to vector
-          await client.query(
-            `INSERT INTO post_embeddings (post_id, user_id, embedding, created_at)
-             VALUES ($1, $2, $3::vector, NOW())`,
-            [post.id, userId, `[${embedding.join(',')}]`]
-          );
-        }
-      } catch (error) {
-        console.error(`Error generating embedding for post ${post.id}:`, error);
-        // Continue with other posts
-      }
+  // Generate embeddings for posts
+  for (const post of posts) {
+    if (!post.text || post.text.trim().length === 0) {
+      continue;
     }
 
-    // Note: DOC 05 says to embed profile "about" section, but post_embeddings requires a post_id
-    // The profile about text is used directly in style profile generation (see generateStyleProfile)
-    // We don't store the profile embedding separately since there's no corresponding post
-    // The style profile captures the writing style which includes profile information
-  } finally {
-    client.release();
+    try {
+      const embedding = await generateEmbedding(post.text);
+
+      // Check if embedding already exists
+      const { data: existingData } = await supabase
+        .from('post_embeddings')
+        .select('*')
+        .eq('post_id', post.id)
+        .single();
+
+      // pgvector expects the embedding as an array
+      // Supabase will handle the conversion to vector type
+
+      if (existingData) {
+        // Update existing embedding
+        const { error } = await supabase
+          .from('post_embeddings')
+          .update({
+            embedding: embedding,
+          })
+          .eq('post_id', post.id);
+
+        if (error) {
+          console.error(`Error updating embedding for post ${post.id}:`, error);
+        }
+      } else {
+        // Insert new embedding
+        // Supabase accepts array format and casts to vector
+        const { error } = await supabase
+          .from('post_embeddings')
+          .insert({
+            post_id: post.id,
+            user_id: userId,
+            embedding: embedding,
+            created_at: new Date().toISOString(),
+          });
+
+        if (error) {
+          console.error(`Error inserting embedding for post ${post.id}:`, error);
+        }
+      }
+    } catch (error) {
+      console.error(`Error generating embedding for post ${post.id}:`, error);
+      // Continue with other posts
+    }
   }
+
+  // Note: DOC 05 says to embed profile "about" section, but post_embeddings requires a post_id
+  // The profile about text is used directly in style profile generation (see generateStyleProfile)
+  // We don't store the profile embedding separately since there's no corresponding post
+  // The style profile captures the writing style which includes profile information
 }
 
 /**
@@ -357,41 +369,61 @@ async function storeStyleProfile(
   styleJson: StyleJson,
   confidence: DataConfidenceLevel
 ): Promise<StyleProfile> {
-  const client = await getDatabaseClient();
-  try {
-    // Check if profile exists
-    const existing = await client.query<StyleProfile>(
-      'SELECT * FROM style_profiles WHERE user_id = $1',
-      [userId]
-    );
+  const supabase = getSupabaseAdminClient();
 
-    let result;
-    if (existing.rows.length > 0) {
-      // Update existing
-      result = await client.query<StyleProfile>(
-        `UPDATE style_profiles
-         SET style_json = $1, data_confidence_level = $2, last_updated_at = NOW()
-         WHERE user_id = $3
-         RETURNING *`,
-        [JSON.stringify(styleJson), confidence, userId]
-      );
-    } else {
-      // Insert new
-      result = await client.query<StyleProfile>(
-        `INSERT INTO style_profiles (user_id, style_json, data_confidence_level, last_updated_at)
-         VALUES ($1, $2, $3, NOW())
-         RETURNING *`,
-        [userId, JSON.stringify(styleJson), confidence]
-      );
+  // Check if profile exists
+  const { data: existingData } = await supabase
+    .from('style_profiles')
+    .select('*')
+    .eq('user_id', userId)
+    .single();
+
+  const now = new Date().toISOString();
+
+  if (existingData) {
+    // Update existing
+    const { data, error } = await supabase
+      .from('style_profiles')
+      .update({
+        style_json: styleJson,
+        data_confidence_level: confidence,
+        last_updated_at: now,
+      })
+      .eq('user_id', userId)
+      .select()
+      .single();
+
+    if (error) {
+      throw new Error(`Error updating style profile: ${error.message}`);
     }
 
-    if (result.rows.length === 0) {
-      throw new Error('Failed to store style profile');
+    if (!data) {
+      throw new Error('Failed to update style profile');
     }
 
-    return result.rows[0];
-  } finally {
-    client.release();
+    return data as StyleProfile;
+  } else {
+    // Insert new
+    const { data, error } = await supabase
+      .from('style_profiles')
+      .insert({
+        user_id: userId,
+        style_json: styleJson,
+        data_confidence_level: confidence,
+        last_updated_at: now,
+      })
+      .select()
+      .single();
+
+    if (error) {
+      throw new Error(`Error creating style profile: ${error.message}`);
+    }
+
+    if (!data) {
+      throw new Error('Failed to create style profile');
+    }
+
+    return data as StyleProfile;
   }
 }
 
@@ -401,32 +433,54 @@ async function storeStyleProfile(
  */
 export async function analyzeUserData(userId: string): Promise<AnalysisResult> {
   try {
-    // Load posts and profile
-    const posts = await queryDatabase<LinkedInPost>(
-      'SELECT * FROM linkedin_posts WHERE user_id = $1 ORDER BY posted_at DESC',
-      [userId]
-    );
+    const supabase = getSupabaseAdminClient();
 
-    const profiles = await queryDatabase<LinkedInProfile>(
-      'SELECT * FROM linkedin_profiles WHERE user_id = $1',
-      [userId]
-    );
+    // Load posts and profile
+    const { data: postsData, error: postsError } = await supabase
+      .from('linkedin_posts')
+      .select('*')
+      .eq('user_id', userId)
+      .order('posted_at', { ascending: false });
+
+    if (postsError) {
+      throw new Error(`Error fetching posts: ${postsError.message}`);
+    }
+
+    const posts = (postsData as LinkedInPost[]) || [];
+
+    const { data: profilesData, error: profilesError } = await supabase
+      .from('linkedin_profiles')
+      .select('*')
+      .eq('user_id', userId)
+      .limit(1)
+      .single();
+
+    if (profilesError && profilesError.code !== 'PGRST116') {
+      throw new Error(`Error fetching profile: ${profilesError.message}`);
+    }
 
     if (posts.length === 0) {
       throw new Error('No posts found for analysis');
     }
 
-    const profile = profiles.length > 0 ? profiles[0] : null;
+    const profile = profilesData as LinkedInProfile | null;
     const profileAbout = profile?.about ?? null;
 
     // Step 1: Compute engagement scores and mark high-performing posts
     await updateEngagementScores(userId, posts);
 
     // Reload posts with updated scores
-    const updatedPosts = await queryDatabase<LinkedInPost>(
-      'SELECT * FROM linkedin_posts WHERE user_id = $1 ORDER BY engagement_score DESC',
-      [userId]
-    );
+    const { data: updatedPostsData, error: updatedPostsError } = await supabase
+      .from('linkedin_posts')
+      .select('*')
+      .eq('user_id', userId)
+      .order('engagement_score', { ascending: false });
+
+    if (updatedPostsError) {
+      throw new Error(`Error fetching updated posts: ${updatedPostsError.message}`);
+    }
+
+    const updatedPosts = (updatedPostsData as LinkedInPost[]) || [];
 
     // Step 2: Generate and store embeddings
     await generateAndStoreEmbeddings(userId, updatedPosts, profileAbout);
